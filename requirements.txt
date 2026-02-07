@@ -1,0 +1,11 @@
+pygame
+pysdl2
+pysdl2-dll
+PyOpenGL
+PyOpenGL-accelerate
+numpy
+shapely
+trimesh
+imageio
+imageio-ffmpeg
+Pillow
