@@ -1011,7 +1011,7 @@ class ChunkMeshBuilder:
                 base_alpha = col[3] if len(col) > 3 else 1.0
                 
                 # Поддержка прозрачности (из предыдущего фикса)
-                is_transparent = (base_alpha < 0.99) or (ent.density < 0.99)
+                is_transparent = (base_alpha < 0.99) 
                 batch_key = (target_tex_id, target_mode, is_transparent)
                 
                 if batch_key not in batches:
@@ -5229,6 +5229,7 @@ class App:
         self.selected_faces = {}
         self.highlighted_ent = None
         self.clipboard = []
+        self.saved_creative_tool = 'SELECT'
         self.snap_unit = 0.1
         self.last_paint_settings = {
             'color': [1.0, 1.0, 1.0, 1.0, 0.0, 0.0], 
@@ -5288,6 +5289,7 @@ class App:
         self.push_pull_original_scale = None
         self.push_pull_original_pos = None
         self.extrusion_start_val = None
+        self.color_picker_dragging = False
     def _init_scene_objects(self):
         self.camera = Camera()
         self.scene = Scene()
@@ -5350,14 +5352,46 @@ class App:
     def _queue_creative_visuals(self):
         px, py, pz = self.camera.pos
         render_dist_sq = 30.0 * 30.0
+        
         for ent in self.scene.entities:
+            # Оптимизация: проверяем дистанцию до "базовой" позиции
             dx = ent.pos[0] - px
             dy = ent.pos[1] - py
             dz = ent.pos[2] - pz
             dist_sq = dx*dx + dy*dy + dz*dz
+            
             if dist_sq > render_dist_sq and not ent.is_hole:
                 continue
+            
+            # --- Подготовка данных анимации (если есть) ---
+            anim_data = None
+            rot_mat = None
+            pivot = None
+            
+            if ent.is_animating:
+                # Ищем данные анимации для этого объекта
+                for a in self.door_animations:
+                    if a['ent'] == ent:
+                        anim_data = a
+                        break
+                
+                if anim_data:
+                    # Рассчитываем матрицу поворота
+                    ang = anim_data['current_angle']
+                    pivot = anim_data['pivot']
+                    axs = anim_data['axis']
+                    rad = math.radians(ang)
+                    c = math.cos(rad)
+                    s = math.sin(rad)
+                    ux, uy, uz = axs
+                    rot_mat = np.array([
+                        [c + ux**2*(1-c),    ux*uy*(1-c) - uz*s, ux*uz*(1-c) + uy*s],
+                        [uy*ux*(1-c) + uz*s, c + uy**2*(1-c),    uy*uz*(1-c) - ux*s],
+                        [uz*ux*(1-c) - uy*s, uz*uy*(1-c) + ux*s, c + uz**2*(1-c)]
+                    ], dtype=np.float32)
+
             if ent.is_hole:
+                # Отрисовка контура дыры (без изменений)
                 min_p, max_p = ent.get_aabb()
                 self.line_renderer.add_box(min_p, max_p, color=(1.0, 0.0, 0.0, 0.8))
                 p1 = [min_p[0], max_p[1], min_p[2]]; p2 = [max_p[0], max_p[1], max_p[2]]
@@ -5365,37 +5399,56 @@ class App:
                 self.line_renderer.add_line(p1, p2, (1, 0, 0, 0.8))
                 self.line_renderer.add_line(p3, p4, (1, 0, 0, 0.8))
             else:
-                for face_idx, c in enumerate(ent.faces_colors):
-                    if len(c) > 4 and c[4] > 0.01:
+                # Проходим по всем граням
+                for face_idx, col_data in enumerate(ent.faces_colors):
+                    # Проверяем Emission (5-й элемент > 0)
+                    if len(col_data) > 4 and col_data[4] > 0.01:
+                        
+                        # Берем исходные размеры (до анимации они совпадают с текущими ent.pos/scale)
                         min_p, max_p = ent.get_aabb()
                         eps = 0.006 
                         p1, p2, p3, p4 = None, None, None, None
+                        
+                        # Расчет координат квадрата (иконки света) на поверхности грани
                         if face_idx == 0: 
                             x = max_p[0] + eps
-                            p1=[x, min_p[1], max_p[2]]; p2=[x, min_p[1], min_p[2]]
-                            p3=[x, max_p[1], min_p[2]]; p4=[x, max_p[1], max_p[2]]
+                            p1=np.array([x, min_p[1], max_p[2]]); p2=np.array([x, min_p[1], min_p[2]])
+                            p3=np.array([x, max_p[1], min_p[2]]); p4=np.array([x, max_p[1], max_p[2]])
                         elif face_idx == 1: 
                             x = min_p[0] - eps
-                            p1=[x, min_p[1], min_p[2]]; p2=[x, min_p[1], max_p[2]]
-                            p3=[x, max_p[1], max_p[2]]; p4=[x, max_p[1], min_p[2]]
+                            p1=np.array([x, min_p[1], min_p[2]]); p2=np.array([x, min_p[1], max_p[2]])
+                            p3=np.array([x, max_p[1], max_p[2]]); p4=np.array([x, max_p[1], min_p[2]])
                         elif face_idx == 2: 
                             y = max_p[1] + eps
-                            p1=[min_p[0], y, max_p[2]]; p2=[max_p[0], y, max_p[2]]
-                            p3=[max_p[0], y, min_p[2]]; p4=[min_p[0], y, min_p[2]]
+                            p1=np.array([min_p[0], y, max_p[2]]); p2=np.array([max_p[0], y, max_p[2]])
+                            p3=np.array([max_p[0], y, min_p[2]]); p4=np.array([min_p[0], y, min_p[2]])
                         elif face_idx == 3: 
                             y = min_p[1] - eps
-                            p1=[min_p[0], y, min_p[2]]; p2=[max_p[0], y, min_p[2]]
-                            p3=[max_p[0], y, max_p[2]]; p4=[min_p[0], y, max_p[2]]
+                            p1=np.array([min_p[0], y, min_p[2]]); p2=np.array([max_p[0], y, min_p[2]])
+                            p3=np.array([max_p[0], y, max_p[2]]); p4=np.array([min_p[0], y, max_p[2]])
                         elif face_idx == 4: 
                             z = max_p[2] + eps
-                            p1=[min_p[0], min_p[1], z]; p2=[max_p[0], min_p[1], z]
-                            p3=[max_p[0], max_p[1], z]; p4=[min_p[0], max_p[1], z]
+                            p1=np.array([min_p[0], min_p[1], z]); p2=np.array([max_p[0], min_p[1], z])
+                            p3=np.array([max_p[0], max_p[1], z]); p4=np.array([min_p[0], max_p[1], z])
                         elif face_idx == 5: 
                             z = min_p[2] - eps
-                            p1=[max_p[0], min_p[1], z]; p2=[min_p[0], min_p[1], z]
-                            p3=[min_p[0], max_p[1], z]; p4=[max_p[0], max_p[1], z]
-                        if p1:
-                            self.sprite_renderer.add_quad(p1, p2, p3, p4, color=(1.0, 0.9, 0.5, 0.8))
+                            p1=np.array([max_p[0], min_p[1], z]); p2=np.array([min_p[0], min_p[1], z])
+                            p3=np.array([min_p[0], max_p[1], z]); p4=np.array([max_p[0], max_p[1], z])
+                        
+                        if p1 is not None:
+                            # --- ФИКС: Если объект анимируется, вращаем точки ---
+                            if anim_data and rot_mat is not None:
+                                p1 = pivot + np.dot(rot_mat, p1 - pivot)
+                                p2 = pivot + np.dot(rot_mat, p2 - pivot)
+                                p3 = pivot + np.dot(rot_mat, p3 - pivot)
+                                p4 = pivot + np.dot(rot_mat, p4 - pivot)
+                            # ----------------------------------------------------
+
+                            # Преобразуем обратно в списки для рендерера
+                            self.sprite_renderer.add_quad(
+                                list(p1), list(p2), list(p3), list(p4), 
+                                color=(1.0, 0.9, 0.5, 0.8)
+                            )
     def attempt_merge_selection(self):
         if len(self.selected_entities) < 2: return
         all_changed_entities = []
@@ -5568,18 +5621,22 @@ class App:
         action_key = None
         d_off = [0.0, 0.0]
         d_scl_factor = [1.0, 1.0]
+        
         if keys.get(sdl2.SDLK_w): d_off[1] += move_step; action_key = 'MOVE_Y_POS'
         if keys.get(sdl2.SDLK_s): d_off[1] -= move_step; action_key = 'MOVE_Y_NEG'
         if keys.get(sdl2.SDLK_d): d_off[0] += move_step; action_key = 'MOVE_X_POS'
         if keys.get(sdl2.SDLK_a): d_off[0] -= move_step; action_key = 'MOVE_X_NEG'
+        
         factor_zoom_in = 1.0 - scale_step
         factor_zoom_out = 1.0 + scale_step
         f_up_right  = factor_zoom_out if is_shift else factor_zoom_in
         f_down_left = factor_zoom_in if is_shift else factor_zoom_out
+        
         if keys.get(sdl2.SDLK_UP):    d_scl_factor[1] *= f_up_right;   action_key = 'SCALE_Y_UP'
         if keys.get(sdl2.SDLK_DOWN):  d_scl_factor[1] *= f_down_left;  action_key = 'SCALE_Y_DOWN'
         if keys.get(sdl2.SDLK_RIGHT): d_scl_factor[0] *= f_up_right;   action_key = 'SCALE_X_RIGHT'
         if keys.get(sdl2.SDLK_LEFT):  d_scl_factor[0] *= f_down_left;  action_key = 'SCALE_X_LEFT'
+        
         if not is_shift and (d_scl_factor[0] != 1.0 or d_scl_factor[1] != 1.0):
             if d_scl_factor[1] != 1.0: 
                 d_scl_factor[0] = d_scl_factor[1]
@@ -5587,7 +5644,10 @@ class App:
             elif d_scl_factor[0] != 1.0: 
                 d_scl_factor[1] = d_scl_factor[0]
                 action_key = 'SCALE_UNIFORM_' + ('A' if d_scl_factor[0] < 1.0 else 'B')
+        
         if action_key:
+            has_large_updates = False # Флаг для больших объектов
+            
             for ent in self.selected_entities:
                 faces_to_edit = range(6)
                 if not self.color_picker.paint_all and ent in self.selected_faces:
@@ -5608,7 +5668,16 @@ class App:
                     data['scl'][1] = max(0.001, min(1000.0, data['scl'][1]))
                 ent.faces_uv_data = new_uv_data
                 self.invalidate_entity_chunks(ent)
+                if max(ent.scale) > self.CHUNK_SIZE:
+                    has_large_updates = True
+            
             self.force_chunk_update = True
+            
+            # --- ФИКС: Обновляем большие объекты ---
+            if has_large_updates:
+                self.compile_large_entities()
+            # ---------------------------------------
+
             current_time = pygame.time.get_ticks()
             if (self.last_tex_action_key != action_key) or (current_time - self.last_tex_action_time > 500):
                 current_state = self._get_current_local_state()
@@ -5892,7 +5961,7 @@ class App:
                 a = col_data[3] if len(col_data) > 3 else 1.0
                 emit = col_data[4] if len(col_data) > 4 else 0.0
                 gloss = col_data[5] if len(col_data) > 5 else 0.0
-                reflect = ent.faces_reflectivity[f_idx] if hasattr(ent, 'faces_reflectivity') else 0.0 
+                reflect = ent.faces_reflectivity[f_idx] if hasattr(ent, 'faces_reflectivity') else 0.0
                 tex_path = ent.faces_textures[f_idx]
                 target_tex_id = white_tex_id
                 target_mode = 0
@@ -6250,6 +6319,13 @@ class App:
     def compile_single_chunk(self, cx, cy, cz):
         self.invalidate_chunk(cx, cy, cz)
         ents = self.get_entities_in_chunk(cx, cy, cz)
+        
+        # --- ИСПРАВЛЕНИЕ: Исключаем большие объекты из меша чанка ---
+        # Они уже рендерятся через cached_large_entities. 
+        # Если этого не сделать, они рисуются дважды -> двойная плотность цвета.
+        ents = [e for e in ents if max(e.scale) <= self.CHUNK_SIZE]
+        # ------------------------------------------------------------
+
         if not ents:
             self.compiled_chunks.add((cx, cy, cz))
             return 
@@ -6459,6 +6535,7 @@ class App:
     def close_color_picker(self, apply=True):
         if self.tex_session_active and self.selected_entities:
             if apply:
+                # Применение изменений (здесь вызывается mark_scene_changed, там мы уже починили)
                 full_data = self.color_picker.get_full_data()
                 color_data = full_data[:6]
                 tex_path = full_data[6]
@@ -6479,12 +6556,25 @@ class App:
                 self.scene.push_modification(self.tex_session_start_states, states_now)
                 self.mark_scene_changed(changed_entities=self.selected_entities)
             else:
+                # Отмена изменений (ESC)
+                has_large_updates = False # Флаг для больших объектов
+                
                 for uid, state_data in self.tex_session_start_states.items():
                     ent = self.scene.get_entity_by_uid(uid)
                     if ent:
                         ent.update_from_dict(state_data)
                         self.invalidate_entity_chunks(ent)
+                        # Проверяем размер
+                        if max(ent.scale) > self.CHUNK_SIZE:
+                            has_large_updates = True
+                
                 self.force_chunk_update = True
+                
+                # --- ФИКС: Если откатили большие объекты, срочно пересобираем их кэш ---
+                if has_large_updates:
+                    self.compile_large_entities()
+                # -----------------------------------------------------------------------
+
         self.tex_session_active = False
         self.tex_session_start_states = {}
         self.local_tex_history = []
@@ -6612,6 +6702,9 @@ class App:
         # Фон (Звезды и Светила)
         self.star_renderer.draw(view_mat, proj_mat, mirrored_pos, self.sun_angle_time, self.sun_angle_tilt, self.sun_rotation_y, self.light_intensity)
         self.draw_celestial_bodies(view_mat, proj_mat)
+        fog_val = self.fog_distance if hasattr(self, 'fog_distance') else 100.0
+        dt_val = self.clock.get_time() / 1000.0 
+        self.cloud_renderer.draw(view_mat, proj_mat, mirrored_pos, self.light_color, self.light_intensity, dt_val, fog_val)
         
         # Шейдер и Чанки
         self.shader.use()
@@ -6650,10 +6743,6 @@ class App:
         glDisable(GL_CLIP_PLANE0)
         glUniform4f(glGetUniformLocation(self.shader.program, "uClipPlane"), 0, 0, 0, 0)
         
-        # Облака
-        fog_val = self.fog_distance if hasattr(self, 'fog_distance') else 100.0
-        dt_val = self.clock.get_time() / 1000.0 
-        self.cloud_renderer.draw(view_mat, proj_mat, mirrored_pos, self.light_color, self.light_intensity, dt_val, fog_val)
         
         glCullFace(GL_BACK) # Возвращаем отсечение
         target_fbo.unbind(self.draw_w, self.draw_h)
@@ -6943,15 +7032,29 @@ class App:
     def mark_scene_changed(self, changed_entities=None):
         self.unsaved_changes = True
         self.build_spatial_grid()
+        
+        # Обновляем список больших объектов (CPU сторона)
         self.cached_large_entities = []
         for ent in self.scene.entities:
             if max(ent.scale) > self.CHUNK_SIZE:
                 self.cached_large_entities.append(ent)
+        
         if changed_entities:
+            # Частичное обновление (при редактировании/создании)
             for ent in changed_entities:
+                # Удаляем старый меш из кэша и инвалидируем чанки
                 self.invalidate_entity_chunks(ent)
+            
+            # --- ФИКС: Принудительно компилируем большие объекты ---
+            # Ранее мы удалили их из кэша (через invalidate), теперь нужно 
+            # создать заново, иначе compile_single_chunk их проигнорирует,
+            # и они станут невидимыми.
+            self.compile_large_entities()
+            # -------------------------------------------------------
+            
             self.force_chunk_update = True
         else:
+            # Полный сброс (при загрузке/очистке)
             self.compiled_chunks.clear()
             self.compile_large_entities() 
             self.force_chunk_update = True
@@ -7500,7 +7603,7 @@ class App:
              self.locked_hinge_edge = -1
              states_after = {e.uid: e.to_dict() for e in targets}
              self.scene.push_modification(states_before, states_after)
-             self.show_notification("DOOR GROUP REMOVED" if len(targets) > 1 else "DOOR REMOVED")
+             self.show_notification(self.tr('NOTIF_DOOR_REMOVED'))
              self.mark_scene_changed(changed_entities=targets)
              return
         if not self.creative_mode:
@@ -8555,7 +8658,11 @@ class App:
         if event.type == sdl2.SDL_MOUSEMOTION:
             mx, my = event.motion.x, event.motion.y 
             if self.state == "GAME" and self.creative_mode and self.color_picker.active:
-                self.color_picker.handle_event(event, None) 
+                # Если виджет обработал событие
+                if self.color_picker.handle_event(event, None):
+                    # Если мы в процессе драга - просто обновляем картинку
+                    if self.color_picker_dragging:
+                        self._apply_live_ui_changes(commit=False)
             if self.state == "PAUSE":
                 self.slider_fog.handle_event(event)
                 self.slider_thick.handle_event(event)
@@ -8606,10 +8713,15 @@ class App:
                 if self.btn_confirm_cancel.check_hover(mx, my): self.btn_confirm_cancel.click()
             elif self.state == "GAME":
                 if self.creative_mode and self.color_picker.active:
+                    # Передаем коллбэк для текстур
                     handled = self.color_picker.handle_event(event, self.open_texture_dialog)
-                    if handled and event.type == sdl2.SDL_MOUSEBUTTONDOWN:
-                        self._apply_live_ui_changes()
+                    if handled:
+                        # Начало перетаскивания: применяем визуально, но не пишем в историю
+                        self.color_picker_dragging = True
+                        self._apply_live_ui_changes(commit=False)
+                    
                     if not handled:
+                        # Клик мимо окна - закрываем
                         self.close_color_picker(apply=False)
                     return
                 if self.mouse_locked:
@@ -8684,7 +8796,13 @@ class App:
                 self.slider_fog.handle_event(event)
                 self.slider_thick.handle_event(event)
             if self.state == "GAME" and self.creative_mode and self.color_picker.active:
-                self.color_picker.handle_event(event, None) 
+                # Отпустили мышь
+                self.color_picker.handle_event(event, None) # Завершаем логику слайдера в UI
+                
+                if self.color_picker_dragging:
+                    # ФИНАЛИЗАЦИЯ: Записываем итоговое значение в историю (один раз)
+                    self._apply_live_ui_changes(commit=True)
+                    self.color_picker_dragging = False
             if self.state == "GAME" and self.creative_mode and self.rect_selecting:
                 self.rect_selecting = False
                 dist = math.hypot(self.rect_current[0] - self.rect_start[0], self.rect_current[1] - self.rect_start[1])
@@ -9359,8 +9477,15 @@ class App:
                 'colors': copy.deepcopy(ent.faces_colors) 
             }
         return state
-    def _apply_live_ui_changes(self):
+    def _apply_live_ui_changes(self, commit=False):
+        """
+        Применяет изменения из UI к энтити.
+        commit=False: Только визуальное обновление (во время перетаскивания).
+        commit=True: Сохранение текущего состояния в историю Undo (при отпускании мыши).
+        """
         if not self.selected_entities: return
+        
+        # Получаем данные из UI
         full_data = self.color_picker.get_full_data()
         r, g, b = full_data[0], full_data[1], full_data[2]
         a = full_data[3]
@@ -9370,36 +9495,59 @@ class App:
         is_tiling_ui = full_data[7]
         density_ui = full_data[8]
         reflectivity_ui = full_data[9]
+        
         changed = False
+        has_large_updates = False # Флаг: были ли затронуты большие объекты
+        
+        # Применяем свойства к энтити
         for ent in self.selected_entities:
+            ent_modified = False
+            
             if abs(ent.density - density_ui) > 0.001:
                 ent.density = density_ui
-                changed = True
+                ent_modified = True
+            
             target_faces = range(6)
             if not self.color_picker.paint_all and ent in self.selected_faces and self.selected_faces[ent]:
                 target_faces = self.selected_faces[ent]
+            
             for f_idx in target_faces:
                 if ent.faces_tiling[f_idx] != is_tiling_ui:
                     ent.faces_tiling[f_idx] = is_tiling_ui
-                    changed = True
+                    ent_modified = True
+                
                 if not hasattr(ent, 'faces_reflectivity'):
                     ent.faces_reflectivity = [0.0] * 6
                 if abs(ent.faces_reflectivity[f_idx] - reflectivity_ui) > 0.001:
                     ent.faces_reflectivity[f_idx] = reflectivity_ui
-                    changed = True
+                    ent_modified = True
+                
                 current_col = ent.faces_colors[f_idx]
                 if current_col[:6] != new_color_list:
                     ent.faces_colors[f_idx] = list(new_color_list)
-                    changed = True
-            if changed:
-                self.invalidate_entity_chunks(ent)    
+                    ent_modified = True
+            
+            if ent_modified:
+                self.invalidate_entity_chunks(ent)
+                changed = True
+                # Проверяем, является ли объект большим
+                if max(ent.scale) > self.CHUNK_SIZE:
+                    has_large_updates = True
+        
         if changed:
+            self.force_chunk_update = True
+            # --- ФИКС: Если меняли большие объекты, перекомпилируем их немедленно ---
+            if has_large_updates:
+                self.compile_large_entities()
+            # ------------------------------------------------------------------------
+
+        # ЛОГИКА ИСТОРИИ
+        if commit:
             new_state = self._get_current_local_state()
             if self.local_tex_history_idx < len(self.local_tex_history) - 1:
                 self.local_tex_history = self.local_tex_history[:self.local_tex_history_idx+1]
             self.local_tex_history.append(new_state)
             self.local_tex_history_idx += 1
-            self.force_chunk_update = True
     def process_continuous(self, dt):
         if hasattr(self, 'file_dialog') and self.file_dialog.active:
             self.file_dialog.update() 
@@ -9690,18 +9838,41 @@ class App:
             self.light_intensity = 0.4 * moon_fade
         self.current_container_ent = None
         px, py, pz = self.camera.pos
-        center_y = py - self.player_height * 0.5
-        nearby = self.get_nearby_entities(px, pz, radius=1, py=center_y)
-        for ent in nearby:
-            if ent.is_hole or ent.is_animating: continue
-            if ent.density < 0.1: continue 
-            min_p, max_p = ent.get_aabb()
-            eps = 0.05
-            if (px > min_p[0] + eps and px < max_p[0] - eps and
-                center_y > min_p[1] + eps and center_y < max_p[1] - eps and
-                pz > min_p[2] + eps and pz < max_p[2] - eps):
-                self.current_container_ent = ent
-                break
+        keep_current = False
+        if self.current_container_ent:
+            ent = self.current_container_ent
+            # Проверяем, существует ли он еще
+            if ent in self.scene.entities:
+                min_p, max_p = ent.get_aabb()
+                # margin 0.25 позволяет камере выныривать на 25см, 
+                # но все еще считать, что мы "в воде" для рендера
+                exit_margin = 0.05 
+                
+                if (px > min_p[0] - exit_margin and px < max_p[0] + exit_margin and
+                    py > min_p[1] - exit_margin and py < max_p[1] + exit_margin and
+                    pz > min_p[2] - exit_margin and pz < max_p[2] + exit_margin):
+                    keep_current = True
+        
+        if not keep_current:
+            self.current_container_ent = None
+            
+            # 2. Если мы не в старом, ищем новый (строгая проверка)
+            # Используем позицию КАМЕРЫ (py), а не центра тела
+            nearby = self.get_nearby_entities(px, pz, radius=1, py=py)
+            for ent in nearby:
+                if ent.is_hole or ent.is_animating: continue
+                # Игнорируем почти прозрачные (призраки)
+                if ent.density < 0.1: continue 
+                
+                min_p, max_p = ent.get_aabb()
+                # Строгий вход: нужно реально погрузиться внутрь на 5см
+                enter_margin = 0.05
+                
+                if (px > min_p[0] + enter_margin and px < max_p[0] - enter_margin and
+                    py > min_p[1] + enter_margin and py < max_p[1] - enter_margin and
+                    pz > min_p[2] + enter_margin and pz < max_p[2] - enter_margin):
+                    self.current_container_ent = ent
+                    break
     def smoothstep(self, edge0, edge1, x):
         t = (x - edge0) / (edge1 - edge0)
         t = max(0.0, min(1.0, t))
@@ -9743,40 +9914,25 @@ class App:
         
         # --- ЛОГИКА МАТРИЦ ---
         if override_view is not None and override_proj is not None:
-            # Это отражение (зеркало)
             view_mat = override_view
             proj_mat = override_proj
-            glCullFace(GL_FRONT) # Для зеркал инвертируем грани
-            
-            # Позиция глаз для шейдера (зеркальная)
+            glCullFace(GL_FRONT) 
             shader_eye_pos = cull_pos if cull_pos is not None else self.camera.pos
         else:
-            # Это основной вид (Глаза игрока)
             glCullFace(GL_BACK)
-            
             aspect = self.draw_w / self.draw_h if self.draw_h > 0 else 1.0
             proj_mat = MatrixUtils.perspective(FOV, aspect, NEAR_CLIP, FAR_CLIP)
-            
-            # === СГЛАЖИВАНИЕ КАМЕРЫ ЗДЕСЬ ===
-            # Создаем временную координату для рендера
             render_pos = np.copy(self.camera.pos)
-            
-            # Если мы в режиме приключения - подменяем высоту на плавную
             if not self.creative_mode:
                 render_pos[1] = self.camera.visual_y
-            
-            # Строим матрицу взгляда от ПЛАВНОЙ позиции
             target = render_pos + self.camera.front
             view_mat = MatrixUtils.look_at(render_pos, target, np.array([0,1,0], dtype=np.float32))
-            
-            # Позиция глаз для шейдера (блики, туман) тоже плавная
             shader_eye_pos = render_pos
             
         self.shader.use()
         self.shader.set_mat4("projection", proj_mat)
         self.shader.set_mat4("view", view_mat)
         
-        # ... (установка uniform-переменных) ...
         glUniform1f(glGetUniformLocation(self.shader.program, "uvScale"), UV_SCALE)
         loc_model = glGetUniformLocation(self.shader.program, "model")
         loc_useWorldUV = glGetUniformLocation(self.shader.program, "useWorldUV")
@@ -9790,8 +9946,6 @@ class App:
         glUniform3f(glGetUniformLocation(self.shader.program, "sunColor"), *self.light_color)
         glUniform3f(glGetUniformLocation(self.shader.program, "ambientColor"), *self.ambient_light)
         glUniform1f(glGetUniformLocation(self.shader.program, "lightIntensity"), self.light_intensity)
-        
-        # Передаем правильную позицию глаз в шейдер
         glUniform3f(glGetUniformLocation(self.shader.program, "viewPos"), *shader_eye_pos)
         
         fog_end = self.slider_fog.value if hasattr(self, 'slider_fog') else 100.0
@@ -9800,7 +9954,7 @@ class App:
         glUniform1f(glGetUniformLocation(self.shader.program, "fogEnd"), fog_end)
         glUniform3f(glGetUniformLocation(self.shader.program, "fogColor"), *self.current_sky_color)
         
-        # --- Свет ---
+        # --- Свет (без изменений) ---
         num_active_lights = 0
         if not self.creative_mode: 
             visible_lights = self._collect_lights_optimized()
@@ -9808,7 +9962,6 @@ class App:
             if has_lantern:
                 lamp_color = (1.0, 0.95, 0.8) 
                 fixed_intensity = 0.9
-                # Фонарик должен исходить из "плавных" глаз, иначе он будет дергаться
                 lamp_pos = shader_eye_pos 
                 player_lamp = (0.0, lamp_pos, lamp_color, fixed_intensity)
                 visible_lights.insert(0, player_lamp)
@@ -9834,7 +9987,7 @@ class App:
                     glUniform1f(glGetUniformLocation(self.shader.program, f"{base_name}.quadratic"), 0.07)
         glUniform1i(glGetUniformLocation(self.shader.program, "numLights"), num_active_lights)
         
-        # --- ОТРИСОВКА HOLES (Stencil) ---
+        # --- Стенсил (HOLES) ---
         glEnable(GL_STENCIL_TEST)
         glClear(GL_STENCIL_BUFFER_BIT) 
         glStencilFunc(GL_ALWAYS, 1, 0xFF)
@@ -9870,9 +10023,8 @@ class App:
         glDisable(GL_STENCIL_TEST)
         glUniformMatrix4fv(loc_model, 1, GL_TRUE, MatrixUtils.identity())
         
-        # === ДВУХПРОХОДНЫЙ РЕНДЕРИНГ ЧАНКОВ ===
+        # === РЕНДЕРИНГ ЧАНКОВ ===
         visible_chunks = []
-        # Для отсечения чанков используем ФИЗИЧЕСКУЮ позицию (чтобы геометрия не исчезала раньше времени)
         check_pos = cull_pos if cull_pos is not None else self.camera.pos
         
         for (cx, cy, cz), mesh_dict in self.chunk_meshes.items():
@@ -9888,7 +10040,7 @@ class App:
             if ent.uid in self.large_objects_gl_cache and not ent.is_animating:
                 visible_large_ents_meshes.append(self.large_objects_gl_cache[ent.uid])
 
-        # --- ПРОХОД 1: Непрозрачные (OPAQUE) ---
+        # Функция отрисовки пакета
         glDepthMask(GL_TRUE)
         glDisable(GL_BLEND)
         
@@ -10057,7 +10209,7 @@ class App:
                 # которая при анимации может быть старой, но для отсечения по дистанции сойдет
                 pass
 
-            vec_to_ent = check_pos - cam_pos
+            vec_to_ent = check_pos - cam_pos_visual
             d2_ent = np.sum(vec_to_ent**2)
             if d2_ent > limit_sq: continue
             
@@ -10140,7 +10292,7 @@ class App:
                 
                 normal_check = np.zeros(3); normal_check[ax] = sg
                 # Простая проверка: если грань отвернута от камеры
-                to_face = current_center - cam_pos
+                to_face = current_center - cam_pos_visual
                 if np.dot(to_face, normal_check) > 0: continue
 
             # --- Проверка видимости (Raycast 5 точек) ---
@@ -10151,13 +10303,13 @@ class App:
             
             is_visible = False
             for test_pt in check_points:
-                vec = test_pt - cam_pos
+                vec = test_pt - cam_pos_visual
                 dst = np.linalg.norm(vec)
                 if dst < 0.001: continue
                 r_dir = vec / dst
                 
-                cands = self.get_candidates_for_ray(cam_pos, r_dir, max_dist=dst + 1.0)
-                hit, hd, _ = self.scene.raycast(cam_pos, r_dir, ignore_holes=True, candidates=cands)
+                cands = self.get_candidates_for_ray(cam_pos_visual, r_dir, max_dist=dst + 1.0)
+                hit, hd, _ = self.scene.raycast(cam_pos_visual, r_dir, ignore_holes=True, candidates=cands)
                 
                 # Если видим точку (hit == m_ent или hit == None или hit дальше зеркала)
                 if hit is None or hit == m_ent or hd >= dst - 0.15:
@@ -10214,7 +10366,8 @@ class App:
 
         self.star_renderer.draw(view_mat, proj_mat, cam_pos_visual, self.sun_angle_time, self.sun_angle_tilt, self.sun_rotation_y, self.light_intensity)
         self.draw_celestial_bodies(view_mat, proj_mat)
-        
+        fog_val = self.fog_distance if hasattr(self, 'fog_distance') else 100.0
+        self.cloud_renderer.draw(view_mat, proj_mat, cam_pos_visual, self.light_color, self.light_intensity, dt, fog_val)
         self.update_chunks()
         
         # Вызываем рендер чанков (он сам возьмет visual_y внутри, так как мы обновили его выше)
@@ -10236,11 +10389,8 @@ class App:
                 mesh.delete()
              glDisable(GL_BLEND)
              
-        fog_val = self.fog_distance if hasattr(self, 'fog_distance') else 100.0
-        self.cloud_renderer.draw(view_mat, proj_mat, cam_pos_visual, self.light_color, self.light_intensity, dt, fog_val)
         
         if self.creative_mode:
-            pass
 
             ray_o, ray_d = self.get_world_ray()
             glEnable(GL_DEPTH_TEST)
@@ -10311,8 +10461,7 @@ class App:
         
         if self.state == "CINECAM" and not self.is_rendering_video:
             glEnable(GL_DEPTH_TEST)
-            self.cine_cam.render_world(view_mat, proj_mat, cam_pos)
-            
+            self.cine_cam.render_world(view_mat, proj_mat, cam_pos_visual)
         self.render_ui()
     def _draw_aligned_face_grid(self, ent, face_idx, color):
         offset = 0.005 
