@@ -1792,6 +1792,9 @@ class ColorPicker:
     def __init__(self, x, y, font):
         self.font = font
         self.active = False
+        # --- ФИКС: Храним функцию перевода ---
+        self.tr_func = lambda k: k 
+        # -------------------------------------
         self.hsv = [0.0, 0.0, 1.0] 
         self.alpha = 1.0 
         self.emission = 0.0
@@ -1859,7 +1862,7 @@ class ColorPicker:
 
     def update_language(self, tr_func):
         # tr_func - это self.app.tr
-        
+        self.tr_func = tr_func
         # Удаляем старые текстуры
         for t in [self.lbl_check_tex, self.lbl_tiling_tex, self.lbl_h_tex, self.lbl_s_tex, 
                   self.lbl_v_tex, self.lbl_a_tex, self.lbl_e_tex, self.lbl_g_tex, 
@@ -1880,8 +1883,8 @@ class ColorPicker:
         self.lbl_tex_btn = safe_text_to_texture(tr_func('CP_LOAD_TEX'), self.font, (255, 255, 255))
         
         # Обновляем динамические строки
-        self.set_texture_name(self.current_texture_path, tr_func)
-        self._update_string_texture(tr_func)
+        self.set_texture_name(self.current_texture_path)
+        self._update_string_texture()
     def handle_event(self, event, on_texture_click=None):
         if not self.active: return False
         if event.type == sdl2.SDL_MOUSEWHEEL:
@@ -1943,10 +1946,11 @@ class ColorPicker:
                 self.update_spectrum(mx, my)
                 return True
         return False
-    def set_texture_name(self, name, tr_func=None):
+    def set_texture_name(self, name):
         self.current_texture_path = name 
         if not name:
-            txt = tr_func('CP_NO_TEX') if tr_func else "No Texture"
+            # Используем сохраненную функцию перевода
+            txt = self.tr_func('CP_NO_TEX')
             self.tex_name_str = txt
             col = (150, 150, 150)
         else:
@@ -1957,14 +1961,18 @@ class ColorPicker:
         
         if self.tex_name_val_tex:
             glDeleteTextures([self.tex_name_val_tex[0]])
-        prefix = tr_func('CP_FILE') if tr_func else "File"
+        
+        # Переводим префикс "File" / "Файл"
+        prefix = self.tr_func('CP_FILE')
         self.tex_name_val_tex = safe_text_to_texture(f"{prefix}: {self.tex_name_str}", self.font, col)
     def update_position(self, x, y, win_h):
         raw_scale = win_h / 700.0
         self.scale = max(1.2, min(1.8, raw_scale))
         curr_w = int(self.base_width * self.scale)
-        curr_h = int(self.base_height * self.scale)
-        self.rect = pygame.Rect(x, y, curr_w, curr_h)
+        
+        # Временно ставим 0, пересчитаем в конце
+        self.rect = pygame.Rect(x, y, curr_w, 0)
+        
         pad = int(10 * self.scale)
         inner_w = curr_w - 2 * pad
         spec_h = int(150 * self.scale)
@@ -2000,10 +2008,17 @@ class ColorPicker:
         btn_h = int(30 * self.scale)
         btn_y = y_checks + check_size + pad * 2
         self.tex_btn_rect = pygame.Rect(self.rect.x + pad, btn_y, inner_w, btn_h)
-    def _update_string_texture(self, tr_func=None):
+        
+        # --- ФИКС: Динамический расчет высоты ---
+        # Нижняя точка кнопки + отступ для текста "File: ..." + нижний отступ
+        text_area_height = int(40 * self.scale) 
+        total_height = (self.tex_btn_rect.bottom - self.rect.y) + text_area_height + pad
+        self.rect.h = total_height
+        # ----------------------------------------
+    def _update_string_texture(self):
         if self.tex_val_str:
             glDeleteTextures([self.tex_val_str[0]])
-        prefix = tr_func('CP_DATA') if tr_func else "Data"
+        prefix = self.tr_func('CP_DATA')
         self.tex_val_str = safe_text_to_texture(f"{prefix}: {self.data_string}", self.font, (255, 255, 255))
     def _generate_spectrum_texture(self):
         w, h = 300, 15
