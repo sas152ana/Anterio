@@ -8885,7 +8885,6 @@ class App:
             nearby = self.get_nearby_entities(px, pz, radius=1, py=py)
             for ent in nearby:
                 if ent.is_hole or ent.is_animating: continue
-                if ent.density < 0.1: continue 
                 min_p, max_p = ent.get_aabb()
                 enter_margin = 0.05
                 if (px > min_p[0] + enter_margin and px < max_p[0] - enter_margin and
@@ -9857,3 +9856,4 @@ class App:
 if __name__ == "__main__":
     app = App()
     app.run()
+
