@@ -2509,7 +2509,7 @@ class FileDialog:
             self.filename_input = ""
         elif mode == 'save':
             if self.is_exporting:
-                ext = self.export_formats[self.current_format_idx].split()[0].lower()
+                ext = self.export_formats[self.current_fmt_idx].split()[0].lower()
                 self.filename_input = f"export.{ext}"
             elif self.is_render:
                 self.filename_input = "cinematic.mp4"
@@ -7121,6 +7121,11 @@ class App:
                         else:
                             slice_norm = np.array([0.0, 1.0, 0.0])
                 self.perform_slice(hit_point, slice_norm, ent, is_alt)
+        elif self.tool_mode == 'CUBE':
+            ray_o, ray_d = self.get_world_ray()
+            c_size, c_center, _, _ = self._get_cube_tool_data(ray_o, ray_d, is_cutting=True)
+            if c_center is not None:
+                self.perform_cube_cut(c_center, c_size)
     def get_smart_cursor(self, ray_o, ray_d):
         keys = self.input.get_keys()
         is_ctrl = keys.get(sdl2.SDLK_LCTRL) or keys.get(sdl2.SDLK_RCTRL)
