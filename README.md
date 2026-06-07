@@ -4,6 +4,11 @@
 
 Welcome to **Anterio**. This is a hybrid of a professional CAD editor and an atmospheric sandbox.
 Here, you don't just place blocks — you work with geometry, vectors, and light physics. The program requires some getting used to, but it gives you complete control over space.
+### Examples
+
+<img width="952" height="733" alt="изображение" src="https://github.com/user-attachments/assets/a6510f43-a15b-4c2e-81c8-11ea86ef3bf3" />
+<img width="936" height="701" alt="изображение" src="https://github.com/user-attachments/assets/a127b095-dbdc-48fd-828a-7e13b2236543" />
+
 
 ## 📐 1. World Basis: Grid, Chunks, and Precision
 
