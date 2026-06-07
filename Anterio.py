@@ -1102,6 +1102,8 @@ for i in range(MAX_MIRRORS):
 DEFAULT_FRAG_SHADER = """
 #version 330 core
 #define MAX_MIRRORS """ + str(MAX_MIRRORS) + """
+#define MAX_OCCLUDERS 32
+
 out vec4 FragColor;
 in vec3 FragPos;
 in vec4 vColor;
@@ -1110,6 +1112,7 @@ in vec2 TexCoord;
 in float vEmission; 
 in float vGloss;
 in float vReflect;
+
 uniform sampler2D uTexMain;
 uniform sampler2D uTexNoise;
 uniform sampler2D uTexReflections[MAX_MIRRORS];
@@ -1124,6 +1127,14 @@ uniform vec3 sunDirection;
 uniform vec3 sunColor;
 uniform vec3 ambientColor;
 uniform float lightIntensity;
+
+// Униформы для аналитических теней, AO и витражей
+uniform vec3 uBoxMin[MAX_OCCLUDERS];
+uniform vec3 uBoxMax[MAX_OCCLUDERS];
+uniform vec4 uBoxColor[MAX_OCCLUDERS]; // Цвет витража (RGB) и его плотность (A)
+uniform int uNumBoxes;
+uniform int uIsCreative;
+
 struct PointLight {
     vec3 position;
     vec3 color;
@@ -1137,6 +1148,116 @@ uniform int numLights;
 uniform vec3 fogColor;
 uniform float fogStart;
 uniform float fogEnd;
+
+// Быстрое пересечение луча и AABB (Slab Method) с умным исправлением ложного самозатенения
+bool rayAABBIntersect(vec3 ro, vec3 rd, vec3 boxMin, vec3 boxMax, out float t) {
+    // Безопасное деление, строго сохраняющее знак направления луча
+    vec3 safe_dir = rd + vec3(
+        rd.x >= 0.0 ? 1e-9 : -1e-9,
+        rd.y >= 0.0 ? 1e-9 : -1e-9,
+        rd.z >= 0.0 ? 1e-9 : -1e-9
+    );
+    vec3 invR = 1.0 / safe_dir;
+    vec3 tbot = invR * (boxMin - ro);
+    vec3 ttop = invR * (boxMax - ro);
+    vec3 tmin = min(tbot, ttop);
+    vec3 tmax = max(tbot, ttop);
+    float t0 = max(tmin.x, max(tmin.y, tmin.z));
+    float t1 = min(tmax.x, min(tmax.y, tmax.z));
+    
+    if (t1 < 0.0) return false; // Коробка находится позади луча
+    
+    if (t0 < 0.0) {
+        // Луч зародился внутри коробки окклюдера или очень близко к её стыку/углу
+        vec3 d_min = ro - boxMin;
+        vec3 d_max = boxMax - ro;
+        
+        float min_x = min(d_min.x, d_max.x);
+        float min_y = min(d_min.y, d_max.y);
+        float min_z = min(d_min.z, d_max.z);
+        
+        float closest_dist = min(min_x, min(min_y, min_z));
+        
+        // Исправление багов углов и тонких просветов:
+        // Если точка старта на стыке (менее 2 см от плоскости) и луч уходит наружу — это не окклюзия
+        if (closest_dist < 0.02) {
+            if (closest_dist == min_x) {
+                if (d_min.x < d_max.x) {
+                    if (rd.x < 0.0) return false;
+                } else {
+                    if (rd.x > 0.0) return false;
+                }
+            } else if (closest_dist == min_y) {
+                if (d_min.y < d_max.y) {
+                    if (rd.y < 0.0) return false;
+                } else {
+                    if (rd.y > 0.0) return false;
+                }
+            } else {
+                if (d_min.z < d_max.z) {
+                    if (rd.z < 0.0) return false;
+                } else {
+                    if (rd.z > 0.0) return false;
+                }
+            }
+        }
+        
+        t = 0.05; 
+        return true;
+    }
+    
+    t = t0;
+    return t1 >= t0;
+}
+
+// Проверка нахождения точки внутри коробки
+bool isInsideAABB(vec3 p, vec3 boxMin, vec3 boxMax) {
+    return (p.x >= boxMin.x && p.x <= boxMax.x &&
+            p.y >= boxMin.y && p.y <= boxMax.y &&
+            p.z >= boxMin.z && p.z <= boxMax.z);
+}
+
+// Динамический мягкий Ambient Occlusion с трехмерным размытием (дизерингом)
+float calculateAO(vec3 p, vec3 normal) {
+    if (uNumBoxes == 0) return 1.0;
+    float occlusion = 0.0;
+    float numSamples = 4.0;
+    
+    vec3 tangent = normalize(cross(normal, vec3(0.0, 1.0, 1.0) + vec3(1e-6)));
+    vec3 bitangent = cross(normal, tangent);
+    
+    // Получаем высокочастотный 3D-шум в мировых координатах для размытия AO
+    vec3 noiseVal = texture(uTexNoise, p.xz * 11.3 + vec2(p.y * 4.7)).rgb;
+    vec3 jitterRaw = (noiseVal - 0.5) * 0.06; // Мягкое размытие в радиусе до 6 см
+    // Проецируем шум на касательную плоскость нормали, чтобы сэмплы не уходили внутрь стен
+    vec3 jitter = jitterRaw - dot(jitterRaw, normal) * normal;
+    
+    vec3 samples[4];
+    samples[0] = p + normal * 0.05;
+    samples[1] = p + normal * 0.12 + tangent * 0.08;
+    samples[2] = p + normal * 0.12 - tangent * 0.08;
+    samples[3] = p + normal * 0.20 + bitangent * 0.10;
+    
+    for (int s = 0; s < 4; s++) {
+        float sampleOcclusion = 0.0;
+        vec3 jitteredSample = samples[s] + jitter; // Накладываем шум на каждый сэмпл
+        
+        for (int i = 0; i < uNumBoxes; i++) {
+            if (uBoxColor[i].a < 0.85) continue;
+            
+            vec3 closestPoint = clamp(jitteredSample, uBoxMin[i], uBoxMax[i]);
+            float dist = length(jitteredSample - closestPoint);
+            
+            float r = 0.20; 
+            float factor = smoothstep(r, 0.0, dist);
+            
+            sampleOcclusion = max(sampleOcclusion, factor);
+        }
+        occlusion += sampleOcclusion;
+    }
+    return 1.0 - (occlusion / numSamples) * 0.25;
+}
+
 void main() {
     vec3 norm = normalize(Normal);
     vec3 viewDir = normalize(viewPos - FragPos);
@@ -1166,6 +1287,44 @@ void main() {
     }
     if(baseColorRGBA.a < 0.01) discard;
     vec3 albedo = baseColorRGBA.rgb;
+    
+    // Считаем динамический Ambient Occlusion
+    float ao = calculateAO(FragPos, norm);
+    
+    // Получаем 3D-шум для размытия теней
+    vec3 shadowNoise = texture(uTexNoise, FragPos.xz * 13.7 + vec2(FragPos.y * 5.3)).rgb;
+    vec3 shadowJitterRaw = (shadowNoise - 0.5) * 0.035; // Радиус размытия до ~3.5 см
+    // Проецируем шум на касательную плоскость нормали, чтобы сдвиг был строго вдоль поверхности
+    vec3 shadowJitter = shadowJitterRaw - dot(shadowJitterRaw, norm) * norm;
+    
+    // Визуальная "световая прокладка" в 1 см для устранения швов на стыках
+    vec3 leakPad = vec3(0.01); 
+    
+    // Динамическое окрашивание/затенение неба (проверка крыши и витражей над головой)
+    vec3 currentAmbientColor = ambientColor;
+    vec3 ro_sky = FragPos + norm * 0.02 + shadowJitter;
+    vec3 rd_sky = vec3(0.0, 1.0, 0.0);   // Проверяем строго вверх
+    for (int b = 0; b < uNumBoxes; b++) {
+        float t;
+        if (rayAABBIntersect(ro_sky, rd_sky, uBoxMin[b] - leakPad, uBoxMax[b] + leakPad, t)) {
+            if (t >= 0.0) { // Изменено для точного учета касательных стыков
+                float opacity = uBoxColor[b].a;
+                vec3 glassColor = uBoxColor[b].rgb;
+                float darkFactor = (uIsCreative == 1) ? 0.7 : 0.1;
+                
+                if (opacity >= 0.95) {
+                    currentAmbientColor *= vec3(darkFactor);
+                    break; // Останавливаемся на первом плотном перекрытии
+                } else {
+                    // Окрашиваем фоновый свет неба в цвет стекла на основе воспринимаемой яркости
+                    float l = dot(currentAmbientColor, vec3(0.299, 0.587, 0.114));
+                    vec3 tintedColor = mix(currentAmbientColor, glassColor * l, opacity);
+                    currentAmbientColor = tintedColor * (1.0 - opacity * (1.0 - darkFactor));
+                }
+            }
+        }
+    }
+    
     vec3 sunDirNorm = normalize(sunDirection);
     float sunDiff = max(dot(norm, sunDirNorm), 0.0);
     float sunSpec = 0.0;
@@ -1173,28 +1332,93 @@ void main() {
         vec3 halfwayDir = normalize(sunDirNorm + viewDir);
         sunSpec = pow(max(dot(norm, halfwayDir), 0.0), 32.0) * vGloss;
     }
-    vec3 ambient = ambientColor * albedo;
-    vec3 sunDiffuse = sunColor * sunDiff * lightIntensity * albedo;
-    vec3 sunSpecular = sunColor * sunSpec * lightIntensity;
+    
+    // Трассировка тени и фильтрация цвета солнца/луны сквозь витражи
+    vec3 currentSunColor = sunColor;
+    if (sunDiff > 0.01 && lightIntensity > 0.01) {
+        vec3 ro_sun = FragPos + norm * 0.02 + shadowJitter;
+        vec3 rd_sun = sunDirNorm;
+        for (int b = 0; b < uNumBoxes; b++) {
+            float t;
+            if (rayAABBIntersect(ro_sun, rd_sun, uBoxMin[b] - leakPad, uBoxMax[b] + leakPad, t)) {
+                if (t >= 0.0) {
+                    float opacity = uBoxColor[b].a;
+                    vec3 glassColor = uBoxColor[b].rgb;
+                    if (opacity >= 0.95) {
+                        currentSunColor = vec3(0.0);
+                        break;
+                    } else {
+                        // Окрашиваем луч солнца на основе яркости
+                        float l = dot(currentSunColor, vec3(0.299, 0.587, 0.114));
+                        vec3 tintedColor = mix(currentSunColor, glassColor * l, opacity);
+                        currentSunColor = tintedColor * (1.0 - opacity * 0.85);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Применяем светофильтрацию к амбиенту и солнечному свету
+    vec3 ambient = currentAmbientColor * albedo * ao;
+    vec3 sunDiffuse = currentSunColor * sunDiff * lightIntensity * albedo;
+    vec3 sunSpecular = currentSunColor * sunSpec * lightIntensity;
+    
     vec3 pointDiffuseTotal = vec3(0.0);
     vec3 pointSpecularTotal = vec3(0.0);
+    vec3 ro_point = FragPos + norm * 0.02 + shadowJitter;
+    
     for(int i = 0; i < numLights; i++) {
         vec3 lightDir = normalize(pointLights[i].position - FragPos);
         float dist = length(pointLights[i].position - FragPos);
         float att = 1.0 / (pointLights[i].constant + pointLights[i].linear * dist + pointLights[i].quadratic * (dist * dist));
+        if (att < 0.01) continue; 
+        
+        vec3 currentColor = pointLights[i].color;
+        
+        // Окрашивание света ламп при прохождении сквозь полупрозрачное стекло
+        if (length(pointLights[i].position - viewPos) > 0.1) {
+            vec3 rd_point = lightDir;
+            for (int b = 0; b < uNumBoxes; b++) {
+                if (isInsideAABB(pointLights[i].position, uBoxMin[b] - leakPad, uBoxMax[b] + leakPad)) {
+                    continue;
+                }
+                float t;
+                if (rayAABBIntersect(ro_point, rd_point, uBoxMin[b] - leakPad, uBoxMax[b] + leakPad, t)) {
+                    if (t >= 0.0 && t < dist - 0.05) {
+                        float opacity = uBoxColor[b].a;
+                        vec3 glassColor = uBoxColor[b].rgb;
+                        if (opacity >= 0.95) {
+                            currentColor = vec3(0.0);
+                            break;
+                        } else {
+                            // Окрашивание цвета лампы на основе воспринимаемой яркости
+                            float l = dot(currentColor, vec3(0.299, 0.587, 0.114));
+                            vec3 tintedColor = mix(currentColor, glassColor * l, opacity);
+                            currentColor = tintedColor * (1.0 - opacity * 0.85);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Если свет полностью поглощен стеклом/стенами, пропускаем этот источник
+        if (length(currentColor) < 0.001) continue;
+        
         float diff = max(dot(norm, lightDir), 0.0);
         float spec = 0.0;
         if(vGloss > 0.01 && diff > 0.0) {
              vec3 halfDir = normalize(lightDir + viewDir);
              spec = pow(max(dot(norm, halfDir), 0.0), 32.0) * vGloss;
         }
-        pointDiffuseTotal += pointLights[i].color * diff * att;
-        pointSpecularTotal += pointLights[i].color * spec * att;
+        pointDiffuseTotal += currentColor * diff * att;
+        pointSpecularTotal += currentColor * spec * att;
     }
+    
     vec3 diffuseTotal = sunDiffuse + pointDiffuseTotal * albedo;
     vec3 specularTotal = sunSpecular + pointSpecularTotal;
     vec3 emissionLight = albedo * vEmission * 1.5; 
     vec3 result = ambient + diffuseTotal + specularTotal + emissionLight;
+    
     if (vReflect > 0.01) {
         vec3 reflectionColor;
         bool foundMirror = false;
@@ -3186,19 +3410,19 @@ class Entity:
             "uid": self.uid,
             "type": "wall",
             "group_id": self.group_id,
-            "group_history": self.group_history,
+            "group_history": list(self.group_history) if self.group_history is not None else [],
             "is_door": self.is_door,
             "door_open": self.door_open, 
             "hinge_edge": self.hinge_edge,
             "is_hole": self.is_hole,
-            "faces_tiling": self.faces_tiling,
-            "faces_reflectivity": self.faces_reflectivity,
+            "faces_tiling": list(self.faces_tiling),
+            "faces_reflectivity": list(self.faces_reflectivity),
             "density": self.density,
             "position": self.pos.tolist(),
             "scale": self.scale.tolist(),
-            "faces_colors": self.faces_colors,
-            "faces_textures": self.faces_textures,
-            "faces_uv_data": self.faces_uv_data 
+            "faces_colors": copy.deepcopy(self.faces_colors),       # Глубокая копия списка списков
+            "faces_textures": list(self.faces_textures),             # Копия списка строк
+            "faces_uv_data": copy.deepcopy(self.faces_uv_data)       # Глубокая копия списка словарей
         }
     @staticmethod
     def from_dict(data):
@@ -4703,6 +4927,25 @@ class App:
         self.large_objects_gl_cache = {}
         self.max_cached_chunks = 20000
         self.force_chunk_update = False
+        # Системы для асинхронной сборки чанков в фоне
+        self.chunk_build_queue = []        # Очередь координат чанков на сборку
+        self.chunk_build_results = {}      # Готовые numpy-массивы геометрии
+        self.chunk_build_lock = threading.Lock()
+        self.chunk_thread_running = True
+        
+        # Запуск фонового потока-строителя
+        self.chunk_thread = threading.Thread(target=self._async_chunk_worker, daemon=True)
+        self.chunk_thread.start()
+        # Инициализация систем для асинхронного сбора освещения
+        self.light_worker_lock = threading.RLock() # Используем RLock для предотвращения блокировок
+        self.async_visible_lights = []
+        self.async_active_occluders = []
+        self.light_thread_id = None                # ID фонового потока
+        self.light_calc_fps = 0                    # Частота работы фонового потока (Гц)
+        
+        # Запуск фонового потока-вычислителя освещения
+        self.light_worker_thread = threading.Thread(target=self._async_light_worker, daemon=True)
+        self.light_worker_thread.start()
     def find_connected_entities(self, target_ent):
         connected = {target_ent}
         to_process = [target_ent]
@@ -4877,6 +5120,35 @@ class App:
         if any_changes:
             self.show_notification(self.tr('NOTIF_MERGED'))
             self.mark_scene_changed(changed_entities=all_changed_entities)
+    def _async_chunk_worker(self):
+        import time
+        while self.chunk_thread_running:
+            coord = None
+            with self.chunk_build_lock:
+                if self.chunk_build_queue:
+                    # Сортируем очередь, чтобы в первую очередь собирать чанки, ближайшие к камере
+                    px, py, pz = self.camera.pos
+                    ccx, ccy, ccz = self.get_chunk_coords(px, pz, py)
+                    self.chunk_build_queue.sort(key=lambda c: (c[0]-ccx)**2 + (c[1]-ccy)**2 + (c[2]-ccz)**2)
+                    coord = self.chunk_build_queue.pop(0)
+            
+            if coord is not None:
+                cx, cy, cz = coord
+                ents = self.get_entities_in_chunk(cx, cy, cz)
+                ents = [e for e in ents if max(e.scale) <= self.CHUNK_SIZE]
+                if ents:
+                    try:
+                        # Тяжелый CPU-просчет геометрии чанка без вызовов OpenGL
+                        batches = ChunkMeshBuilder.build_chunk_data(ents, (cx, cy, cz), self.texture_manager)
+                        with self.chunk_build_lock:
+                            self.chunk_build_results[coord] = batches
+                    except Exception as e:
+                        print(f"Ошибка фоновой сборки чанка {coord}: {e}")
+                else:
+                    with self.chunk_build_lock:
+                        self.chunk_build_results[coord] = {} # Пустой чанк
+            else:
+                time.sleep(0.005) # Спим 5мс, чтобы не перегружать процессор холостым циклом
     def perform_undo(self):
         changed_list = self.scene.undo()
         if changed_list:
@@ -5247,12 +5519,13 @@ class App:
                 for cy in range(scy - 1, ecy + 2):
                     for cz in range(scz - 1, ecz + 2):
                         chunks_to_rebuild.add((cx, cy, cz))
-            self.door_animations.append({
-                'ent': target, 'master': master_ent, 'pivot': pivot, 'axis': axis,
-                'current_angle': 0.0, 'target_delta': target_delta, 'speed': speed,
-                'original_pos': target.pos.copy(), 'original_scale': target.scale.copy(),
-                'is_opening': not master_ent.door_open
-            })
+            with self.light_worker_lock:
+                self.door_animations.append({
+                    'ent': target, 'master': master_ent, 'pivot': pivot, 'axis': axis,
+                    'current_angle': 0.0, 'target_delta': target_delta, 'speed': speed,
+                    'original_pos': target.pos.copy(), 'original_scale': target.scale.copy(),
+                    'is_opening': not master_ent.door_open
+                })
         for (cx, cy, cz) in chunks_to_rebuild:
             self.compile_single_chunk(cx, cy, cz)
         self.scene_dirty_creative = True
@@ -5417,81 +5690,82 @@ class App:
         return max_h
     def update_door_animations(self, dt):
         finished = []
-        for anim in self.door_animations:
-            step = anim['speed'] * dt
-            anim['current_angle'] += step
-            finished_step = False
-            if anim['target_delta'] > 0:
-                if anim['current_angle'] >= anim['target_delta']:
-                    anim['current_angle'] = anim['target_delta']
-                    finished_step = True
-            else:
-                if anim['current_angle'] <= anim['target_delta']:
-                    anim['current_angle'] = anim['target_delta']
-                    finished_step = True
-            if finished_step:
-                finished.append(anim)
-        chunks_to_invalidate = set()
-        for anim in finished:
-            self.door_animations.remove(anim)
-            ent = anim['ent']
-            master = anim['master']
-            ent.is_animating = False
-            pivot = anim['pivot']
-            axis_vec = anim['axis']
-            rotation_angle = anim['target_delta']
-            axis_idx = np.argmax(np.abs(axis_vec))
-            def collect_chunks(pos, scale, target_set):
-                half = scale / 2.0
-                mn = pos - half
-                mx = pos + half
-                scx, scy, scz = self.get_chunk_coords(mn[0], mn[2], mn[1])
-                ecx, ecy, ecz = self.get_chunk_coords(mx[0], mx[2], mx[1])
-                for cx in range(scx, ecx + 1):
-                    for cy in range(scy, ecy + 1):
-                        for cz in range(scz, ecz + 1):
-                            target_set.add((cx, cy, cz))
-            collect_chunks(anim['original_pos'], anim['original_scale'], chunks_to_invalidate)
-            rel_pos = anim['original_pos'] - pivot
-            new_rel = np.copy(rel_pos)
-            new_scale = np.copy(anim['original_scale'])
-            is_positive = (rotation_angle > 0)
-            if axis_idx == 1:
-                if is_positive: new_rel[0] = rel_pos[2]; new_rel[2] = -rel_pos[0]
-                else:           new_rel[0] = -rel_pos[2]; new_rel[2] = rel_pos[0]
-                new_scale[0] = anim['original_scale'][2]
-                new_scale[2] = anim['original_scale'][0]
-            elif axis_idx == 0:
-                if is_positive: new_rel[1] = -rel_pos[2]; new_rel[2] = rel_pos[1]
-                else:           new_rel[1] = rel_pos[2]; new_rel[2] = -rel_pos[1]
-                new_scale[1] = anim['original_scale'][2]
-                new_scale[2] = anim['original_scale'][1]
-            elif axis_idx == 2:
-                if is_positive: new_rel[0] = -rel_pos[1]; new_rel[1] = rel_pos[0]
-                else:           new_rel[0] = rel_pos[1]; new_rel[1] = -rel_pos[0]
-                new_scale[0] = anim['original_scale'][1]
-                new_scale[1] = anim['original_scale'][0]
-            ent.pos = pivot + new_rel
-            ent.scale = new_scale
-            ent.pos, ent.scale = snap_bounds_to_grid_3d(ent.pos, ent.scale, precision=0.01)
-            rot_dir = 1 if rotation_angle > 0 else -1
-            if axis_idx == 1: TextureUtils.rotate_entity_data(ent, 1, rot_dir)
-            elif axis_idx == 0: TextureUtils.rotate_entity_data(ent, 0, rot_dir)
-            elif axis_idx == 2: TextureUtils.rotate_entity_data(ent, 2, rot_dir)
-            ent.door_angle = 0.0
-            ent.door_open = not ent.door_open
-            if ent == master:
-                new_hinge_idx, _, _ = self.get_closest_edge_info(ent, pivot)
-                if new_hinge_idx != -1:
-                    ent.hinge_edge = new_hinge_idx
-            collect_chunks(ent.pos, ent.scale, chunks_to_invalidate)
-        if finished:
-            self.build_spatial_grid()
-            for (cx, cy, cz) in chunks_to_invalidate:
-                self.invalidate_chunk(cx, cy, cz)
-            self.force_chunk_update = True
-            self.unsaved_changes = True
-            self.cached_large_entities = [e for e in self.scene.entities if max(e.scale) > self.CHUNK_SIZE]
+        with self.light_worker_lock:
+            for anim in list(self.door_animations): # используем копию списка для безопасности
+                step = anim['speed'] * dt
+                anim['current_angle'] += step
+                finished_step = False
+                if anim['target_delta'] > 0:
+                    if anim['current_angle'] >= anim['target_delta']:
+                        anim['current_angle'] = anim['target_delta']
+                        finished_step = True
+                else:
+                    if anim['current_angle'] <= anim['target_delta']:
+                        anim['current_angle'] = anim['target_delta']
+                        finished_step = True
+                if finished_step:
+                    finished.append(anim)
+            chunks_to_invalidate = set()
+            for anim in finished:
+                self.door_animations.remove(anim)
+                ent = anim['ent']
+                master = anim['master']
+                ent.is_animating = False
+                pivot = anim['pivot']
+                axis_vec = anim['axis']
+                rotation_angle = anim['target_delta']
+                axis_idx = np.argmax(np.abs(axis_vec))
+                def collect_chunks(pos, scale, target_set):
+                    half = scale / 2.0
+                    mn = pos - half
+                    mx = pos + half
+                    scx, scy, scz = self.get_chunk_coords(mn[0], mn[2], mn[1])
+                    ecx, ecy, ecz = self.get_chunk_coords(mx[0], mx[2], mx[1])
+                    for cx in range(scx, ecx + 1):
+                        for cy in range(scy, ecy + 1):
+                            for cz in range(scz, ecz + 1):
+                                target_set.add((cx, cy, cz))
+                collect_chunks(anim['original_pos'], anim['original_scale'], chunks_to_invalidate)
+                rel_pos = anim['original_pos'] - pivot
+                new_rel = np.copy(rel_pos)
+                new_scale = np.copy(anim['original_scale'])
+                is_positive = (rotation_angle > 0)
+                if axis_idx == 1:
+                    if is_positive: new_rel[0] = rel_pos[2]; new_rel[2] = -rel_pos[0]
+                    else:           new_rel[0] = -rel_pos[2]; new_rel[2] = rel_pos[0]
+                    new_scale[0] = anim['original_scale'][2]
+                    new_scale[2] = anim['original_scale'][0]
+                elif axis_idx == 0:
+                    if is_positive: new_rel[1] = -rel_pos[2]; new_rel[2] = rel_pos[1]
+                    else:           new_rel[1] = rel_pos[2]; new_rel[2] = -rel_pos[1]
+                    new_scale[1] = anim['original_scale'][2]
+                    new_scale[2] = anim['original_scale'][1]
+                elif axis_idx == 2:
+                    if is_positive: new_rel[0] = -rel_pos[1]; new_rel[1] = rel_pos[0]
+                    else:           new_rel[0] = rel_pos[1]; new_rel[1] = -rel_pos[0]
+                    new_scale[0] = anim['original_scale'][1]
+                    new_scale[1] = anim['original_scale'][0]
+                ent.pos = pivot + new_rel
+                ent.scale = new_scale
+                ent.pos, ent.scale = snap_bounds_to_grid_3d(ent.pos, ent.scale, precision=0.01)
+                rot_dir = 1 if rotation_angle > 0 else -1
+                if axis_idx == 1: TextureUtils.rotate_entity_data(ent, 1, rot_dir)
+                elif axis_idx == 0: TextureUtils.rotate_entity_data(ent, 0, rot_dir)
+                elif axis_idx == 2: TextureUtils.rotate_entity_data(ent, 2, rot_dir)
+                ent.door_angle = 0.0
+                ent.door_open = not ent.door_open
+                if ent == master:
+                    new_hinge_idx, _, _ = self.get_closest_edge_info(ent, pivot)
+                    if new_hinge_idx != -1:
+                        ent.hinge_edge = new_hinge_idx
+                collect_chunks(ent.pos, ent.scale, chunks_to_invalidate)
+            if finished:
+                self.build_spatial_grid()
+                for (cx, cy, cz) in chunks_to_invalidate:
+                    self.invalidate_chunk(cx, cy, cz)
+                self.force_chunk_update = True
+                self.unsaved_changes = True
+                self.cached_large_entities = [e for e in self.scene.entities if max(e.scale) > self.CHUNK_SIZE]
     def get_chunk_coords(self, x, z, y=None):
         val_y = y if y is not None else 0
         cx = int(math.floor(x / self.CHUNK_SIZE))
@@ -5499,7 +5773,7 @@ class App:
         cz = int(math.floor(z / self.CHUNK_SIZE))
         return cx, cy, cz
     def build_spatial_grid(self):
-        self.spatial_grid = {}
+        new_grid = {}
         for ent in self.scene.entities:
             half = ent.scale / 2.0
             e_min = ent.pos - half
@@ -5510,9 +5784,16 @@ class App:
                 for cy in range(scy, ecy + 1):
                     for cz in range(scz, ecz + 1):
                         key = (cx, cy, cz)
-                        if key not in self.spatial_grid:
-                            self.spatial_grid[key] = []
-                        self.spatial_grid[key].append(ent)
+                        if key not in new_grid:
+                            new_grid[key] = []
+                        new_grid[key].append(ent)
+        with self.light_worker_lock:
+            self.spatial_grid = new_grid
+            # Кэшируем только те объекты, которые действительно имеют отражающие свойства
+            self.reflective_entities = [
+                ent for ent in self.scene.entities 
+                if hasattr(ent, 'faces_reflectivity') and max(ent.faces_reflectivity) > 0.01
+            ]
     def get_candidates_for_ray(self, ray_o, ray_d, max_dist=100.0):
         candidates = set()
         step_size = 2.0 
@@ -5538,6 +5819,37 @@ class App:
                     if key in self.spatial_grid:
                         nearby.extend(self.spatial_grid[key])
         return nearby
+    def collect_active_occluders(self, max_count=16, center_pos=None):
+        if center_pos is None:
+            center_pos = self.camera.pos
+        px, py, pz = center_pos
+        nearby = self.get_nearby_entities(px, pz, radius=2, py=py)
+        
+        unique_ents = []
+        seen = set()
+        for e in nearby:
+            if e.uid not in seen:
+                seen.add(e.uid)
+                unique_ents.append(e)
+        
+        occluders = []
+        for e in unique_ents:
+            if e.is_hole or e.is_animating:
+                continue
+            col = e.faces_colors[2]
+            alpha = col[3] if len(col) > 3 else 1.0
+            if alpha < 0.01 and e.density < 0.01:
+                continue
+            occluders.append(e)
+        
+        occluders.sort(key=lambda e: np.sum((e.pos - center_pos)**2))
+        return occluders[:max_count]
+    def is_creative_lighting(self):
+        # Если идет финальный рендер видео, принудительно используем свет приключений
+        if self.is_rendering_video:
+            return False
+        # В остальных случаях упрощенный свет используется в творческом режиме или в режиме настройки кинокамеры
+        return self.creative_mode or self.state == "CINECAM"
     def calculate_extrusion_raw(self, ray_o, ray_d, base_rect_or_p, normal_override=None):
         if isinstance(base_rect_or_p, dict):
             p1 = base_rect_or_p['p1']
@@ -5673,19 +5985,12 @@ class App:
                 visible.append(ent)
         return visible
     def compile_single_chunk(self, cx, cy, cz):
-        self.invalidate_chunk(cx, cy, cz)
-        ents = self.get_entities_in_chunk(cx, cy, cz)
-        ents = [e for e in ents if max(e.scale) <= self.CHUNK_SIZE]
-        if not ents:
-            self.compiled_chunks.add((cx, cy, cz))
-            return 
-        batches = ChunkMeshBuilder.build_chunk_data(ents, (cx, cy, cz), self.texture_manager)
-        chunk_meshes_dict = {}
-        for (tex_id, mode, is_trans), data_array in batches.items():
-            chunk_meshes_dict[(tex_id, mode, is_trans)] = MeshBuffer(data_array)
-        if chunk_meshes_dict:
-            self.chunk_meshes[(cx, cy, cz)] = chunk_meshes_dict
-        self.compiled_chunks.add((cx, cy, cz))
+        coord = (cx, cy, cz)
+        with self.chunk_build_lock:
+            if coord not in self.chunk_build_queue:
+                self.chunk_build_queue.append(coord)
+                if coord in self.compiled_chunks:
+                    self.compiled_chunks.remove(coord)
     def render_video_sequence(self, filename):
         if not imageio:
             return
@@ -5748,6 +6053,27 @@ class App:
             self.clock.tick() 
             self.show_notification(self.tr('NOTIF_RENDER_DONE'))
     def update_chunks(self, force_radius=None, render_radius=None):
+        # 1. Переносим готовые расчеты из фонового потока в OpenGL (выполняется один раз)
+        completed_coords = []
+        with self.chunk_build_lock:
+            completed_coords = list(self.chunk_build_results.keys())
+            
+        for coord in completed_coords:
+            with self.chunk_build_lock:
+                batches = self.chunk_build_results.pop(coord)
+            
+            self.invalidate_chunk(*coord)
+            
+            chunk_meshes_dict = {}
+            for (tex_id, mode, is_trans), data_array in batches.items():
+                if len(data_array) > 0:
+                    chunk_meshes_dict[(tex_id, mode, is_trans)] = MeshBuffer(data_array)
+            
+            if chunk_meshes_dict:
+                self.chunk_meshes[coord] = chunk_meshes_dict
+            self.compiled_chunks.add(coord)
+            
+        # 2. Обычная логика проверки радиуса и координат
         if render_radius is None:
             render_radius = int(self.fog_distance / self.CHUNK_SIZE) + 2
         render_radius = max(2, render_radius)
@@ -5756,12 +6082,15 @@ class App:
         if render_radius != self.last_used_render_radius:
             self.force_chunk_update = True
             self.last_used_render_radius = render_radius
+            
         px, py, pz = self.camera.pos
         cx, cy, cz = self.get_chunk_coords(px, pz, py)
         current_coord = (cx, cy, cz)
         self.floor_renderer.update(cx, cz, render_radius)
+        
         if current_coord == self.last_chunk_coord and not self.force_chunk_update and not force_radius:
             return
+            
         existing_chunks = list(self.chunk_meshes.keys())
         unload_dist_sq = (render_radius + 2) ** 2
         for coord in existing_chunks:
@@ -5774,6 +6103,7 @@ class App:
                 del self.chunk_meshes[coord]
                 if coord in self.compiled_chunks:
                     self.compiled_chunks.remove(coord)
+                    
         self.chunk_load_queue = []
         self.last_chunk_coord = current_coord
         self.force_chunk_update = False
@@ -5793,6 +6123,7 @@ class App:
                         self.compiled_chunks.add(coord)
                         continue
                     candidates.append(coord)
+                    
         candidates.sort(key=lambda c: (c[0]-cx)**2 + (c[1]-cy)**2 + (c[2]-cz)**2)
         self.chunk_load_queue = candidates
         if self.chunk_load_queue:
@@ -5848,7 +6179,8 @@ class App:
                     'reflectivity': refl_val, 
                     'texture_path': tex_path
                 }
-                self.apply_paint(color_data, self.color_picker.paint_all, is_tiling, density_val, tex_path, refl_val)
+                # Передаем record_undo=False, чтобы избежать дублирования записи в историю
+                self.apply_paint(color_data, self.color_picker.paint_all, is_tiling, density_val, tex_path, refl_val, record_undo=False)
                 self.color_picker.add_to_history()
                 states_now = {e.uid: e.to_dict() for e in self.selected_entities}
                 self.scene.push_modification(self.tex_session_start_states, states_now)
@@ -5890,6 +6222,167 @@ class App:
         elif norm[2] > 0.5: return 4
         elif norm[2] < -0.5: return 5
         return None
+    def _async_light_worker(self):
+        import time
+        self.light_thread_id = threading.get_ident() # Записываем ID фонового потока для отладки
+        self.light_calc_count = 0
+        self.light_calc_fps = 0
+        last_fps_time = time.time()
+        
+        while self.chunk_thread_running:
+            if not getattr(self, 'project_active', False):
+                time.sleep(0.1)
+                continue
+            
+            cam_pos = None
+            if hasattr(self, 'camera'):
+                cam_pos = np.copy(self.camera.pos)
+                
+            if cam_pos is not None:
+                # 1. Быстро забираем снимки структур под блокировкой (занимает < 1 микросекунды)
+                with self.light_worker_lock:
+                    grid_snapshot = self.spatial_grid
+                    animations_snapshot = list(self.door_animations)
+                
+                # 2. Вычисляем все тяжелые математические алгоритмы БЕЗ блокировок (Lock-Free)
+                lights = self._collect_lights_optimized_background(cam_pos, grid_snapshot, animations_snapshot)
+                occluders = self._collect_active_occluders_background(32, cam_pos, grid_snapshot)
+                
+                # 3. Быстро обновляем результаты под блокировкой
+                with self.light_worker_lock:
+                    self.async_visible_lights = lights
+                    self.async_active_occluders = occluders
+                
+                self.light_calc_count += 1
+                
+            # Считаем частоту работы фонового потока
+            now = time.time()
+            if now - last_fps_time >= 1.0:
+                self.light_calc_fps = self.light_calc_count
+                self.light_calc_count = 0
+                last_fps_time = now
+                
+            time.sleep(5)
+
+    def _collect_lights_optimized_background(self, cam_pos_np, grid_snapshot, animations_snapshot):
+        px, py, pz = cam_pos_np
+        radius = 2 
+        cx, cy, cz = self.get_chunk_coords(px, pz, py)
+        normals = [
+            np.array([ 1.0,  0.0,  0.0], dtype=np.float32), 
+            np.array([-1.0,  0.0,  0.0], dtype=np.float32), 
+            np.array([ 0.0,  1.0,  0.0], dtype=np.float32), 
+            np.array([ 0.0, -1.0,  0.0], dtype=np.float32), 
+            np.array([ 0.0,  0.0,  1.0], dtype=np.float32), 
+            np.array([ 0.0,  0.0, -1.0], dtype=np.float32)  
+        ]
+        lights = []
+        
+        # Полностью Lock-Free цикл расчетов!
+        for dx in range(-radius, radius + 1):
+            for dy in range(-1, 2):
+                for dz in range(-radius, radius + 1):
+                    key = (cx + dx, cy + dy, cz + dz)
+                    if key not in grid_snapshot: continue
+                    for ent in grid_snapshot[key]:
+                        if ent.is_animating: continue 
+                        if abs(ent.pos[0] - px) > 45 or abs(ent.pos[2] - pz) > 45:
+                            continue
+                        color_groups = {}
+                        has_emission = False
+                        for i in range(6):
+                            col = ent.faces_colors[i]
+                            if len(col) > 4 and col[4] > 0.05:
+                                has_emission = True
+                                rgb_key = (round(col[0], 2), round(col[1], 2), round(col[2], 2))
+                                intensity = col[4]
+                                if rgb_key not in color_groups:
+                                    color_groups[rgb_key] = [[], 0.0]
+                                color_groups[rgb_key][0].append(normals[i])
+                                color_groups[rgb_key][1] += intensity
+                        if not has_emission:
+                            continue
+                        for rgb, data in color_groups.items():
+                            vec_list = data[0]
+                            total_intensity = data[1]
+                            count = len(vec_list)
+                            avg_normal = np.sum(vec_list, axis=0)
+                            norm_len = np.linalg.norm(avg_normal)
+                            if norm_len > 0.001:
+                                avg_normal /= norm_len 
+                            offset_dist = max(ent.scale) * 0.6
+                            light_pos = ent.pos + avg_normal * offset_dist
+                            avg_int = total_intensity / count
+                            final_intensity = avg_int * (1.0 + (count - 1) * 0.2)
+                            dist_sq = np.sum((light_pos - cam_pos_np)**2)
+                            lights.append((dist_sq, light_pos, rgb, final_intensity))
+            
+            for anim in animations_snapshot:
+                ent = anim['ent']
+                angle_deg = anim['current_angle']
+                pivot = anim['pivot']
+                axis_vec = anim['axis']
+                rad = math.radians(angle_deg)
+                c = math.cos(rad)
+                s = math.sin(rad)
+                ux, uy, uz = axis_vec
+                rot_mat = np.array([
+                    [c + ux**2*(1-c),    ux*uy*(1-c) - uz*s, ux*uz*(1-c) + uy*s],
+                    [uy*ux*(1-c) + uz*s, c + uy**2*(1-c),    uy*uz*(1-c) - ux*s],
+                    [uz*ux*(1-c) - uy*s, uz*uy*(1-c) + ux*s, c + uz**2*(1-c)]
+                ], dtype=np.float32)
+                for i in range(6):
+                    col = ent.faces_colors[i]
+                    if len(col) > 4 and col[4] > 0.05:
+                        intensity = col[4]
+                        rgb = (col[0], col[1], col[2])
+                        base_normal = normals[i]
+                        rotated_normal = np.dot(rot_mat, base_normal)
+                        orig_pos = anim['original_pos']
+                        face_offset_local = base_normal * (ent.scale[i//2] * 0.5 + 0.1)
+                        face_center_orig = orig_pos + face_offset_local
+                        vec = face_center_orig - pivot
+                        rotated_vec = np.dot(rot_mat, vec)
+                        final_light_pos = pivot + rotated_vec
+                        dist_sq = np.sum((final_light_pos - cam_pos_np)**2)
+                        lights.append((dist_sq, final_light_pos, rgb, intensity))
+                        
+        lights.sort(key=lambda x: x[0])
+        return [(math.sqrt(l[0]), l[1], l[2], l[3]) for l in lights]
+
+    def _collect_active_occluders_background(self, max_count, center_pos, grid_snapshot):
+        px, py, pz = center_pos
+        occluders = []
+        
+        # Полностью Lock-Free цикл расчетов!
+        cx, cy, cz = self.get_chunk_coords(px, pz, py)
+        nearby = []
+        radius = 2
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    key = (cx + dx, cy + dy, cz + dz)
+                    if key in grid_snapshot:
+                        nearby.extend(grid_snapshot[key])
+                        
+        unique_ents = []
+        seen = set()
+        for e in nearby:
+            if e.uid not in seen:
+                seen.add(e.uid)
+                unique_ents.append(e)
+        
+        for e in unique_ents:
+            if e.is_hole or e.is_animating:
+                continue
+            col = e.faces_colors[2]
+            alpha = col[3] if len(col) > 3 else 1.0
+            if alpha < 0.01 and e.density < 0.01:
+                continue
+            occluders.append(e)
+            
+        occluders.sort(key=lambda e: np.sum((e.pos - center_pos)**2))
+        return occluders[:max_count]
     def auto_select_hovered(self):
         ray_o, ray_d = self.get_world_ray()
         cands = self.get_candidates_for_ray(ray_o, ray_d)
@@ -5901,7 +6394,7 @@ class App:
                 self.selected_faces = {ent: {face_idx}}
             return True
         return False
-    def apply_paint(self, color, paint_all, is_tiling=False, density=1.0, texture_path=None, reflectivity=0.0):
+    def apply_paint(self, color, paint_all, is_tiling=False, density=1.0, texture_path=None, reflectivity=0.0, record_undo=True):
         if not self.selected_entities: return
         states_before = {e.uid: e.to_dict() for e in self.selected_entities}
         changes_made = False
@@ -5944,8 +6437,9 @@ class App:
                 changes_made = True
                 self.invalidate_entity_chunks(ent)
         if changes_made:
-            states_after = {e.uid: e.to_dict() for e in self.selected_entities}
-            self.scene.push_modification(states_before, states_after)
+            if record_undo: # Запись в историю происходит только при активном флаге
+                states_after = {e.uid: e.to_dict() for e in self.selected_entities}
+                self.scene.push_modification(states_before, states_after)
             self.mark_scene_changed(changed_entities=self.selected_entities)
     def _render_reflection_pass(self, mirror_ent, target_fbo, axis, sign, override_plane_point=None, override_plane_normal=None):
         if override_plane_point is not None and override_plane_normal is not None:
@@ -7582,6 +8076,7 @@ class App:
         self.local_tex_history = []
         self.local_tex_history_idx = -1
         self.tex_session_active = False
+        self.reflective_entities = []
     def _draw_button_bg(self, btn):
         col = (0.3, 0.3, 0.3, 0.8) if btn.hovered else (0.2, 0.2, 0.2, 0.8)
         self.solid_renderer.add_quad_2d(btn.rect.x, btn.rect.y, btn.rect.w, btn.rect.h, col)
@@ -7700,7 +8195,11 @@ class App:
                 if self.lbl_tool.tex: self.sprite_renderer.draw_ui_sprite(self.lbl_tool.tex, (width - self.lbl_tool.w)//2, height - self.lbl_hint.h - self.lbl_snap.h - self.lbl_tool.h - margin*3, self.lbl_tool.w, self.lbl_tool.h, ui_proj)
             self.fps_timer += 1
             if self.fps_timer > 30:
-                self.lbl_fps.set_text(f"FPS: {int(self.clock.get_fps())}")
+                main_tid = threading.get_ident()
+                bg_tid = getattr(self, 'light_thread_id', 'None')
+                bg_hz = getattr(self, 'light_calc_fps', 0)
+                # Показываем, что потоки имеют РАЗНЫЕ Thread ID и фоновый воркер работает независимо на своей частоте Гц
+                self.lbl_fps.set_text(f"FPS: {int(self.clock.get_fps())} | Light Worker: {bg_hz}Hz (Main TID: {main_tid} | Light TID: {bg_tid})")
                 self.fps_timer = 0
             if self.lbl_fps.tex:
                 padding_right = 10
@@ -8745,6 +9244,7 @@ class App:
             mesh.draw()
             mesh.delete()
     def _cleanup(self):
+        self.chunk_thread_running = False
         sdl2.SDL_GL_DeleteContext(self.gl_context)
         sdl2.SDL_DestroyWindow(self.window)
         sdl2.SDL_Quit()
@@ -8948,7 +9448,41 @@ class App:
             target = render_pos + self.camera.front
             view_mat = MatrixUtils.look_at(render_pos, target, np.array([0,1,0], dtype=np.float32))
             shader_eye_pos = render_pos
+            
         self.shader.use()
+        
+        # --- Сбор активных окклюдеров и их цветов для витражного освещения ---
+        check_pos = cull_pos if cull_pos is not None else self.camera.pos
+        with self.light_worker_lock:
+            occluders = list(self.async_active_occluders)
+        num_boxes = len(occluders)
+        
+        box_min_array = []
+        box_max_array = []
+        box_color_array = []
+        for ent in occluders:
+            b_min, b_max = ent.get_aabb()
+            box_min_array.extend(b_min.tolist())
+            box_max_array.extend(b_max.tolist())
+            
+            # Получаем цвет верхней грани (или любой другой)
+            col = ent.faces_colors[2] 
+            r, g, b = col[0], col[1], col[2]
+            a = col[3] if len(col) > 3 else 1.0
+            # Итоговая непрозрачность зависит от альфы цвета и физической плотности
+            opacity = a * ent.density
+            box_color_array.extend([r, g, b, opacity])
+            
+        glUniform1i(glGetUniformLocation(self.shader.program, "uNumBoxes"), num_boxes)
+        if num_boxes > 0:
+            glUniform3fv(glGetUniformLocation(self.shader.program, "uBoxMin"), num_boxes, box_min_array)
+            glUniform3fv(glGetUniformLocation(self.shader.program, "uBoxMax"), num_boxes, box_max_array)
+            glUniform4fv(glGetUniformLocation(self.shader.program, "uBoxColor"), num_boxes, box_color_array)
+            
+        # Передаем динамический статус освещения (с учетом рендера видео) в шейдер
+        glUniform1i(glGetUniformLocation(self.shader.program, "uIsCreative"), 1 if self.is_creative_lighting() else 0)
+        # --------------------------------------------------------------------
+        
         self.shader.set_mat4("projection", proj_mat)
         self.shader.set_mat4("view", view_mat)
         glUniform1f(glGetUniformLocation(self.shader.program, "uvScale"), UV_SCALE)
@@ -8969,9 +9503,12 @@ class App:
         glUniform1f(glGetUniformLocation(self.shader.program, "fogStart"), fog_start)
         glUniform1f(glGetUniformLocation(self.shader.program, "fogEnd"), fog_end)
         glUniform3f(glGetUniformLocation(self.shader.program, "fogColor"), *self.current_sky_color)
+        
         num_active_lights = 0
-        if not self.creative_mode: 
-            visible_lights = self._collect_lights_optimized()
+        if not self.is_creative_lighting(): 
+            with self.light_worker_lock:
+                visible_lights = list(self.async_visible_lights)
+                
             has_lantern = (self.lantern_radius > 1.0) 
             if has_lantern:
                 lamp_color = (1.0, 0.95, 0.8) 
@@ -8999,6 +9536,7 @@ class App:
                     glUniform1f(glGetUniformLocation(self.shader.program, f"{base_name}.constant"), 1.0)
                     glUniform1f(glGetUniformLocation(self.shader.program, f"{base_name}.linear"), 0.14)
                     glUniform1f(glGetUniformLocation(self.shader.program, f"{base_name}.quadratic"), 0.07)
+                    
         glUniform1i(glGetUniformLocation(self.shader.program, "numLights"), num_active_lights)
         glEnable(GL_STENCIL_TEST)
         glClear(GL_STENCIL_BUFFER_BIT) 
@@ -9032,12 +9570,13 @@ class App:
         glUniform1i(loc_useWorldUV, 0)
         glDisable(GL_STENCIL_TEST)
         glUniformMatrix4fv(loc_model, 1, GL_TRUE, MatrixUtils.identity())
+        
         visible_chunks = []
-        check_pos = cull_pos if cull_pos is not None else self.camera.pos
         for (cx, cy, cz), mesh_dict in self.chunk_meshes.items():
             if self.is_chunk_visible(cx, cy, cz, check_pos, override_front):
                 visible_chunks.append(mesh_dict)
-        render_r = 24 if self.creative_mode else 12
+                
+        render_r = 24 if self.is_creative_lighting() else 12
         r2 = render_r ** 2
         visible_large_ents_meshes = []
         visible_large_ents = self.get_visible_large_entities(r2 * 100)
@@ -9045,8 +9584,10 @@ class App:
             if skip_ent is not None and ent == skip_ent: continue
             if ent.uid in self.large_objects_gl_cache and not ent.is_animating:
                 visible_large_ents_meshes.append(self.large_objects_gl_cache[ent.uid])
+                
         glDepthMask(GL_TRUE)
         glDisable(GL_BLEND)
+        
         def render_mesh_dict(mesh_dict, draw_transparent):
             for (tex_id, mode, is_trans), mesh in mesh_dict.items():
                 if is_trans == draw_transparent:
@@ -9054,10 +9595,12 @@ class App:
                     glBindTexture(GL_TEXTURE_2D, tex_id)
                     glUniform1i(loc_texType, mode)
                     mesh.draw()
+                    
         for mesh_dict in visible_chunks:
             render_mesh_dict(mesh_dict, draw_transparent=False)
         for mesh_dict in visible_large_ents_meshes:
             render_mesh_dict(mesh_dict, draw_transparent=False)
+            
         glDepthMask(GL_FALSE)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -9071,16 +9614,19 @@ class App:
                 d2 = (ccx-px)**2 + (ccy-py)**2 + (ccz-pz)**2
                 sorted_chunks.append((d2, mesh_dict))
         sorted_chunks.sort(key=lambda x: x[0], reverse=True)
+        
         for _, mesh_dict in sorted_chunks:
             render_mesh_dict(mesh_dict, draw_transparent=True)
         for mesh_dict in visible_large_ents_meshes:
             render_mesh_dict(mesh_dict, draw_transparent=True)
+            
         if self.current_container_ent:
             glDisable(GL_CULL_FACE)
             glUniformMatrix4fv(glGetUniformLocation(self.shader.program, "model"), 1, GL_TRUE, MatrixUtils.identity())
             glUniform1i(glGetUniformLocation(self.shader.program, "useWorldUV"), 0)
             self._render_specific_entity_internal(self.current_container_ent)
             glEnable(GL_CULL_FACE)
+            
         glDisable(GL_BLEND)
         glDepthMask(GL_TRUE)
         glUseProgram(0)
@@ -9185,9 +9731,11 @@ class App:
         limit_sq = 120.0 * 120.0
         potential_faces = []
         face_defs = [(0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)]
-        for ent in self.scene.entities:
-            if not hasattr(ent, 'faces_reflectivity'): continue
-            if max(ent.faces_reflectivity) < 0.01: continue
+        with self.light_worker_lock:
+            reflective_candidates = list(self.reflective_entities)
+            
+        for ent in reflective_candidates:
+            # hasattr и max проверять больше не нужно, объекты уже отфильтрованы!
             check_pos = ent.pos
             if ent.is_animating:
                 pass
@@ -9317,7 +9865,7 @@ class App:
                 mesh.draw()
                 mesh.delete()
              glDisable(GL_BLEND)
-        if self.creative_mode:
+        if self.is_creative_lighting():
             ray_o, ray_d = self.get_world_ray()
             glEnable(GL_DEPTH_TEST)
             glDepthMask(False) 
@@ -9771,88 +10319,7 @@ class App:
             lx = sx + ox - (label.w // 2)
             ly = sy + oy - (label.h // 2)
             self.labels_to_draw_queue.append((label, lx, ly))
-    def _collect_lights_optimized(self):
-        lights = []
-        px, py, pz = self.camera.pos
-        radius = 2 
-        cx, cy, cz = self.get_chunk_coords(px, pz, py)
-        normals = [
-            np.array([ 1.0,  0.0,  0.0], dtype=np.float32), 
-            np.array([-1.0,  0.0,  0.0], dtype=np.float32), 
-            np.array([ 0.0,  1.0,  0.0], dtype=np.float32), 
-            np.array([ 0.0, -1.0,  0.0], dtype=np.float32), 
-            np.array([ 0.0,  0.0,  1.0], dtype=np.float32), 
-            np.array([ 0.0,  0.0, -1.0], dtype=np.float32)  
-        ]
-        cam_pos_np = self.camera.pos
-        for dx in range(-radius, radius + 1):
-            for dy in range(-1, 2):
-                for dz in range(-radius, radius + 1):
-                    key = (cx + dx, cy + dy, cz + dz)
-                    if key not in self.spatial_grid: continue
-                    for ent in self.spatial_grid[key]:
-                        if ent.is_animating: continue 
-                        if abs(ent.pos[0] - px) > 45 or abs(ent.pos[2] - pz) > 45:
-                            continue
-                        color_groups = {}
-                        has_emission = False
-                        for i in range(6):
-                            col = ent.faces_colors[i]
-                            if len(col) > 4 and col[4] > 0.05:
-                                has_emission = True
-                                rgb_key = (round(col[0], 2), round(col[1], 2), round(col[2], 2))
-                                intensity = col[4]
-                                if rgb_key not in color_groups:
-                                    color_groups[rgb_key] = [[], 0.0]
-                                color_groups[rgb_key][0].append(normals[i])
-                                color_groups[rgb_key][1] += intensity
-                        if not has_emission:
-                            continue
-                        for rgb, data in color_groups.items():
-                            vec_list = data[0]
-                            total_intensity = data[1]
-                            count = len(vec_list)
-                            avg_normal = np.sum(vec_list, axis=0)
-                            norm_len = np.linalg.norm(avg_normal)
-                            if norm_len > 0.001:
-                                avg_normal /= norm_len 
-                            offset_dist = max(ent.scale) * 0.6
-                            light_pos = ent.pos + avg_normal * offset_dist
-                            avg_int = total_intensity / count
-                            final_intensity = avg_int * (1.0 + (count - 1) * 0.2)
-                            dist_sq = np.sum((light_pos - cam_pos_np)**2)
-                            lights.append((dist_sq, light_pos, rgb, final_intensity))
-        for anim in self.door_animations:
-            ent = anim['ent']
-            angle_deg = anim['current_angle']
-            pivot = anim['pivot']
-            axis_vec = anim['axis']
-            rad = math.radians(angle_deg)
-            c = math.cos(rad)
-            s = math.sin(rad)
-            ux, uy, uz = axis_vec
-            rot_mat = np.array([
-                [c + ux**2*(1-c),    ux*uy*(1-c) - uz*s, ux*uz*(1-c) + uy*s],
-                [uy*ux*(1-c) + uz*s, c + uy**2*(1-c),    uy*uz*(1-c) - ux*s],
-                [uz*ux*(1-c) - uy*s, uz*uy*(1-c) + ux*s, c + uz**2*(1-c)]
-            ], dtype=np.float32)
-            for i in range(6):
-                col = ent.faces_colors[i]
-                if len(col) > 4 and col[4] > 0.05:
-                    intensity = col[4]
-                    rgb = (col[0], col[1], col[2])
-                    base_normal = normals[i]
-                    rotated_normal = np.dot(rot_mat, base_normal)
-                    orig_pos = anim['original_pos']
-                    face_offset_local = base_normal * (ent.scale[i//2] * 0.5 + 0.1)
-                    face_center_orig = orig_pos + face_offset_local
-                    vec = face_center_orig - pivot
-                    rotated_vec = np.dot(rot_mat, vec)
-                    final_light_pos = pivot + rotated_vec
-                    dist_sq = np.sum((final_light_pos - cam_pos_np)**2)
-                    lights.append((dist_sq, final_light_pos, rgb, intensity))
-        lights.sort(key=lambda x: x[0])
-        return [(math.sqrt(l[0]), l[1], l[2], l[3]) for l in lights]
+    
 if __name__ == "__main__":
     app = App()
     app.run()
